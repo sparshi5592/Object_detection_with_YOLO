@@ -9,19 +9,19 @@ import matplotlib.pyplot as plt
 def get_random_data(annotation_lines, input_shape):
     """this function is to get the labelled box and the image data"""
     
-    tmp_split = annotation_lines.split()
-    box = []
-    img_dir = tmp_split[0]
-    for x in range(len(tmp_split) - 1):
-        line = tmp_split[x+1].split(" ")
-        line = line[0].split(",")
-        line =[float(y) for y in line]
-        box.append(line) 
-    box = np.array(box)
-    max_box = 20
+    tmp_split = re.split("( \d)", annotation_lines, maxsplit=1)
+    if len(tmp_split) > 2:
+        line = tmp_split[0], tmp_split[1] + tmp_split[2]
+    else:
+        line = tmp_split
+    # line[0] contains the filename
     
-    image = Image.open(img_dir)
-    plt.imshow(image)
+    image = Image.open(line[0])
+    # The rest of the line includes bounding boxes
+    line = line[1].split(" ")
+    
+    box = np.array([np.array(list(map(int, box.split(",")))) for box in line[1:]])
+    max_box = 20
     h , w = input_shape
 
     iw , ih  = image.size

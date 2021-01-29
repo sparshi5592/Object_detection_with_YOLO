@@ -7,7 +7,7 @@ from tensorflow.keras.callbacks import ModelCheckpoint,ReduceLROnPlateau,EarlySt
 from tensorflow.keras.optimizers import Adam
 import os
 
-from yolo import yolov3,yolo_loss
+from model import yolo_body,yolo_loss
 from get_image_data import get_random_data, preprocess_true_boxes
 
 def get_anchors(anchor_path):
@@ -41,8 +41,8 @@ def create_model(input_shape,no_classes,anchors,load_pretrained_weight = True,fr
     image_shape = Input(shape=(None,None,3))
     h ,w = input_shape
     no_anchors = len(anchors)//3
-    
-    yolo_body = yolov3(image_shape , no_anchors , no_classes)
+    print(weight_path)
+    _yolo_body = yolo_body(image_shape , no_anchors , no_classes)
     
     y_true = [
         Input(
@@ -57,16 +57,16 @@ def create_model(input_shape,no_classes,anchors,load_pretrained_weight = True,fr
     ]
     
     if load_pretrained_weight:
-        yolo_body.load_weights(weight_path , by_name = True, skip_mismatch = True)
+        _yolo_body.load_weights(weight_path , by_name = True, skip_mismatch = True)
         print("Load weights {}.".format(weight_path))
         if freeze_body in [1, 2]:
             # Freeze darknet53 body or freeze all but 3 output layers.
-            num = (185, len(yolo_body.layers) - 3)[freeze_body - 1]
+            num = (20, len(_yolo_body.layers) - 2)[freeze_body - 1]
             for i in range(num):
-                yolo_body.layers[i].trainable = False
+                _yolo_body.layers[i].trainable = False
             print(
                 "Freeze the first {} layers of total {} layers.".format(
-                    num, len(yolo_body.layers)
+                    num, len(_yolo_body.layers)
                 )
             )
 
@@ -74,24 +74,33 @@ def create_model(input_shape,no_classes,anchors,load_pretrained_weight = True,fr
                     name = "yolo_loss",
                     arguments = {"anchors" :anchors ,
                                 "num_classes" : no_classes,
-                                "ignore_thresh":0.5},)([*yolo_body.output, *y_true])
+                                "ignore_thresh":0.5},)([*_yolo_body.output, *y_true])
     
-    model = Model([yolo_body.input , *y_true],loss )
+    model = Model([_yolo_body.input , *y_true],loss )
     return model
 
 def get_data(annotation_lines,batch_size,input_shape,anchors,no_classes):
     """ This function is to get the image and the box data for training"""
-    while True:
-        image_data = []
-        box_data = []
-        for x in range(len(annotation_lines)-1):
-            image, box = get_random_data(annotation_lines[x+1], input_shape)
-            box_data.append(box)    
-            image_data.append(image)
-
-        image_data = np.array(image_data)
-        box_data = np.array(box_data)
-        y_true = preprocess_true_boxes(box_data,input_shape,anchors,no_classes)
+    n = len(annotation_lines)
+    i = 0
+    #if n == 0 or batch_size <=0:
+        #return None
+    #else:
+    if True:    
+        while True:
+            image_data = []
+            box_data = []
+            for x in range(len(annotation_lines)):
+                if i ==0 :
+                  np.random.shuffle(annotation_lines)
+                print(annotation_lines[i])
+                image, box = get_random_data(annotation_lines[i], input_shape)
+                box_data.append(box)    
+                image_data.append(image)
+                i = (i+1) % n
+            image_data = np.array(image_data)
+            box_data = np.array(box_data)
+            y_true = preprocess_true_boxes(box_data,input_shape,anchors,no_classes)
 
         yield [image_data, *y_true], np.zeros(batch_size)
     
@@ -104,15 +113,17 @@ def train(testing = True):
       
     classes_path = CWD + '/model_data/data_classes.txt'
     annotation_path = CWD + '/model_data/data_train.txt'
-    weight_path = CWD # + path of the pretrained weight
+    _weight_path = CWD  + '/model_data/yolo.h5'
     log_dir = CWD + '/data_log/'
     anchors = get_anchors(anchor_path)
+    print(len(anchors))
     classes = get_classes(classes_path)
     annotation_lines = get_annotations(annotation_path)
-
+    num_val = int(len(annotation_lines)*0.1)
+    num_train = len(annotation_lines) - num_val
     input_shape = (416,416)
     no_classes = len(classes)
-    model = create_model(input_shape,no_classes,anchors,load_pretrained_weight = False)
+    model = create_model(input_shape,no_classes,anchors,load_pretrained_weight = True, freeze_body = 2,weight_path = _weight_path)
     
     no_annotations = len(annotation_lines)
     
@@ -133,39 +144,39 @@ def train(testing = True):
     #this is check if the training is going in proper way and to adjust the epochs with first 5 data set
     if testing:
         
-        model.compile(optimizer= Adam(lr = 0.001),
+        model.compile(optimizer= Adam(lr = 1e-3),
                         loss= {"yolo_loss":lambda y_true, y_pred:y_pred})
 
-        batch_size = 32
+        batch_size = 8
         
-        model.fit_generator(get_data(annotation_lines,batch_size,input_shape,anchors,no_classes),
-                            steps_per_epoch=1,
+        model.fit_generator(get_data(annotation_lines[:num_train],batch_size,input_shape,anchors,no_classes),
+                            steps_per_epoch=max(1 , num_train//batch_size),
                             callbacks=[logging,checkpoint],
                             epochs= 50,initial_epoch= 0,
-                            validation_data= get_data(annotation_lines[:10],batch_size,input_shape,anchors,no_classes),
-                            validation_steps=1)
+                            validation_data= get_data(annotation_lines[num_train:],batch_size,input_shape,anchors,no_classes),
+                            validation_steps=max(1 , num_val//batch_size))
         
         model.save_weights(log_dir + "trail_1_training.h5")
 
-    if not testing:
+    if True:
         num_layers = len(model.layers)
 
         for x in range(num_layers):
             model.layers[x].trainable = True
         
     
-        model.compile(optimizer= Adam(lr = 0.001),
+        model.compile(optimizer= Adam(lr = 1e-4),
                         loss= {"yolo_loss":lambda y_true, y_pred:y_pred})
 
         print("Training started with unfreezing and with {} samples and with the batch size of {} ." .format(no_annotations,batch_size))
         batch_size = 16
         
         model.fit_generator(get_data(annotation_lines,batch_size,input_shape,anchors,no_classes),
-                            steps_per_epoch=1,
+                            steps_per_epoch=max(1, num_train//batch_size),
                             callbacks=[logging,checkpoint,reduce_lr,early_stopping],
                             epochs= 100,initial_epoch= 50,
-                            validation_data= get_data(annotation_lines[:10],batch_size,input_shape,anchors,no_classes),
-                            validation_steps=1)
+                            validation_data= get_data(annotation_lines[num_train:],batch_size,input_shape,anchors,no_classes),
+                            validation_steps=max(1,num_val//batch_size))
         
         model.save_weights(log_dir + "final_trained_weights.h5")
 
