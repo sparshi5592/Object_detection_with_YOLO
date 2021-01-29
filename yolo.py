@@ -7,6 +7,7 @@ from keras.models import Model
 from tensorflow.keras.regularizers import L2
 import tensorflow.keras.backend as K
 
+from functools import wraps
 
 
 def compose(*funcs):
@@ -20,29 +21,31 @@ def compose(*funcs):
     else:
         raise ValueError("Composition of empty sequence not supported.")
 
+@wraps(Conv2D)
+def DarknetConv2D(*args, **kwargs):
+    """Wrapper to set Darknet parameters for Convolution2D."""
+    darknet_conv_kwargs = {"kernel_regularizer": L2(5e-4)}
+    darknet_conv_kwargs["padding"] = (
+        "valid" if kwargs.get("strides") == (2, 2) else "same"
+    )
+    darknet_conv_kwargs.update(kwargs)
+    return Conv2D(*args, **darknet_conv_kwargs)
 
-def conv2d(no_filter,filter_size, **kwargs):
-    """ Convolutional layer of the darknet"""
-    
-    if kwargs.get("stride") == (2,2):
-        y = "valid"
-        x = (2,2)
-    else:
-        y = "same"
-        x = (1,1)
-        
-    conv = compose(Conv2D(no_filter, filter_size, strides = x, padding= y ,use_bias=False , kernel_regularizer=L2(0.0005 )),
-                   BatchNormalization(),
-                   LeakyReLU(alpha = 0.1),) 
-    # conv = BatchNormalization() (conv)
-    # conv = LeakyReLU(alpha = 0.1)(conv)
-    return conv
+def conv2d(*args, **kwargs):
+    """Darknet Convolution2D followed by BatchNormalization and LeakyReLU."""
+    no_bias_kwargs = {"use_bias": False}
+    no_bias_kwargs.update(kwargs)
+    return compose(
+        DarknetConv2D(*args, **no_bias_kwargs),
+        BatchNormalization(),
+        LeakyReLU(alpha=0.1),
+    )
 
 
 def residual_block(x,no_filter,no_times):
     """residual block which is used in the darknet"""
     x = ZeroPadding2D(((1,0),(1,0)))(x)
-    x = conv2d(no_filter,(3 , 3),stride=(2,2))(x)
+    x = conv2d(no_filter,(3 , 3),strides=(2,2))(x)
     for a in range(no_times):
         y = compose(conv2d(no_filter//2 , (1,1)),conv2d(no_filter , (3 ,3)),)(x) 
 
@@ -56,11 +59,11 @@ def darknet53(x):
     x = residual_block(x , 64 , 1)
     x = residual_block(x , 128 , 2)
     x = residual_block(x , 256 , 8)
-    x2 = x
+    
     x = residual_block(x , 512 , 8)
-    x1 = x
+    
     x = residual_block(x , 1024 , 4)
-    return x , x1 , x2
+    return x 
 
 def make_last_layer(x , no_filter, out_filter):
     """this is last layer consisting 5 DBL followed by Convolutional layer"""
@@ -68,28 +71,27 @@ def make_last_layer(x , no_filter, out_filter):
                 conv2d(no_filter*2,(3,3)),
                 conv2d(no_filter,(1,1)),
                 conv2d(no_filter*2,(3,3)),
-                conv2d(no_filter,(1,1)))(x)
+                conv2d(no_filter,(1,1)),)(x)
     y = compose(conv2d(no_filter*2,(3,3)),
-                Conv2D(out_filter,(1,1),strides=(1,1),padding='same',use_bias=False,kernel_regularizer=L2(0.0005))
-                )(x)
+                DarknetConv2D(out_filter, (1, 1))
+                ,)(x)
 
     return x, y
 
-def yolov3(input,no_anchors,no_classes):
+def yolov3(inputs,no_anchors,no_classes):
     """YOLOV3 CNN taking arguments Input,no_anchors and no_classes"""
-    x , x1 , x2 = darknet53(input)
+    darknet = Model(inputs, darknet53(inputs))
+    x, y1 = make_last_layer(darknet.output, 512, no_anchors * (no_classes + 5))
 
-    x , y1 = make_last_layer(x , 512 , no_anchors*(no_classes+5))
+    x = compose(conv2d(256, (1, 1)), UpSampling2D(2))(x)
+    x = Concatenate()([x, darknet.layers[152].output])
+    x, y2 = make_last_layer(x, 256, no_anchors * (no_classes + 5))
 
-    x = compose(conv2d(256,(1,1)),UpSampling2D(2))(x)
-    x = Concatenate()([x , x1])
-    x , y2 = make_last_layer(x , 256 , no_anchors*(no_classes+5))
+    x = compose(conv2d(128, (1, 1)), UpSampling2D(2))(x)
+    x = Concatenate()([x, darknet.layers[92].output])
+    x, y3 = make_last_layer(x, 128, no_anchors * (no_classes + 5))
 
-    x = compose(conv2d(256,(1,1)),UpSampling2D(2))(x)
-    x = Concatenate()([x , x2])
-    x , y3 = make_last_layer(x , 256 , no_anchors*(no_classes+5))
-
-    return Model(input ,[y1 , y2 , y3])
+    return Model(inputs, [y1, y2, y3])
 
 def decode(yolo_out, anchors, num_classes, input_shape, calc_loss=False):
     """Takes the YOLO out and predicts the bounding boxes"""
@@ -99,15 +101,15 @@ def decode(yolo_out, anchors, num_classes, input_shape, calc_loss=False):
     yolo_shape = K.shape(yolo_out)[1:3] #height and width
     
 
-    yolo_out = K.reshape(yolo_out,(-1 , yolo_shape[0] , yolo_shape[1] , 3 , 5+num_classes)) #here 3 is the no of anchors
+    yolo_out = K.reshape(yolo_out,[-1 , yolo_shape[0] , yolo_shape[1] , 3 , 5+num_classes]) #here 3 is the no of anchors
        
-    t_xy = yolo_out[: , : , : , : , 0:2] #x and y position from the center
+    t_xy = yolo_out[..., :2] #x and y position from the center
 
-    t_wh = yolo_out[: , : , : , : , 2:4] #box width and height
+    t_wh = yolo_out[..., 2:4] #box width and height
 
-    confidence = yolo_out[: , : , : , : , 4:5] # confidence if the box
+    confidence = yolo_out[..., 4:5] # confidence if the box
 
-    class_prob = yolo_out[: , : , : , : , 5: ] #class probablities
+    class_prob = yolo_out[..., 5: ] #class probablities
 
     grid_y = K.tile(
         K.reshape(K.arange(0, stop=yolo_shape[0]), [-1, 1, 1, 1]),
@@ -123,7 +125,7 @@ def decode(yolo_out, anchors, num_classes, input_shape, calc_loss=False):
     #Calculate bounding box xy
     b_xy = (K.sigmoid(t_xy) + grid)/K.cast(yolo_shape[::-1], K.dtype(yolo_out))
 
-    b_wh = (K.exp(t_wh)*anchor_tensor)/K.cast(input_shape[::-1], K.dtype(yolo_out))
+    b_wh = (K.exp(t_wh)*anchor_tensor/K.cast(input_shape[::-1], K.dtype(yolo_out)))
 
     b_c = K.sigmoid(confidence)
 
